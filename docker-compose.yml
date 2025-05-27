@@ -1,60 +1,125 @@
-version: "3.7"
+x-customizable-image: &customizable_image
+  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
+  pull_policy: ${PULL_POLICY:-always}
+  restart: ${RESTART_POLICY:-unless-stopped}
+
+x-depends-on-configurator: &depends_on_configurator
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+x-backend-defaults: &backend_defaults
+  <<: [*depends_on_configurator, *customizable_image]
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
 
 services:
+  # --------- BASE DE DATOS (MariaDB) ----------
   mariadb:
     image: mariadb:10.6
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_PASSWORD: admin123
+      MYSQL_USER: frappe
+      MYSQL_PASSWORD: frappe
+      MYSQL_DATABASE: erpnext
     volumes:
       - mariadb_data:/var/lib/mysql
-    restart: always
+      - ./config/mysql/my.cnf:/etc/mysql/conf.d/my.cnf
 
+  # --------- REDIS CACHE ----------
   redis-cache:
-    image: redis:alpine
-    restart: always
-
-  redis-queue:
-    image: redis:alpine
-    restart: always
-
-  redis-socketio:
-    image: redis:alpine
-    restart: always
-
-  site-creator:
-    image: frappe/bench:version-14
-    command: new
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory 256mb", "--maxmemory-policy allkeys-lru"]
     volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - .:/workspace
-    working_dir: /workspace
+      - redis_cache_data:/data
+
+  # --------- REDIS QUEUE ----------
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory 256mb", "--maxmemory-policy allkeys-lru"]
+    volumes:
+      - redis_queue_data:/data
+
+  # --------- FRAPPE/ERPNext STACK -------------
+  configurator:
+    <<: *backend_defaults
+    platform: linux/amd64
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
     environment:
-      - SITE_NAME=${FRAPPE_SITE_NAME}
-      - INSTALL_APPS=${INSTALL_APPS}
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-    depends_on:
-      - mariadb
-      - redis-cache
-      - redis-queue
-      - redis-socketio
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      REDIS_CACHE: ${REDIS_CACHE}
+      REDIS_QUEUE: ${REDIS_QUEUE}
+      SOCKETIO_PORT: 9000
+    depends_on: {}
+    restart: on-failure
 
   backend:
-    image: frappe/bench:version-14
-    command: start
-    ports:
-      - "8000:8000"
+    <<: *backend_defaults
+    platform: linux/amd64
+
+  frontend:
+    <<: *customizable_image
+    platform: linux/amd64
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
-      - .:/workspace
-    working_dir: /workspace
     depends_on:
-      - mariadb
-      - redis-cache
-      - redis-queue
-      - redis-socketio
-    restart: always
+      - backend
+      - websocket
+    ports:
+      - "8080:8080"
+
+  websocket:
+    <<: [*depends_on_configurator, *customizable_image]
+    platform: linux/amd64
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+
+  queue-short:
+    <<: *backend_defaults
+    platform: linux/amd64
+    command: bench worker --queue short,default
+
+  queue-long:
+    <<: *backend_defaults
+    platform: linux/amd64
+    command: bench worker --queue long,default,short
+
+  scheduler:
+    <<: *backend_defaults
+    platform: linux/amd64
+    command: bench schedule
 
 volumes:
-  mariadb_data:
   sites:
+  mariadb_data:
+  redis_cache_data:
+  redis_queue_data:
